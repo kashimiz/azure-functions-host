@@ -1,16 +1,16 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
-using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Authorization.Policy;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Azure.AppService.Proxy.Client;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
@@ -18,79 +18,92 @@ using Microsoft.Azure.WebJobs.Script.WebHost.Features;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 
-namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
+namespace Microsoft.Azure.WebJobs.Script.WebHost.Proxy
 {
-    public class FunctionInvocationMiddleware
+    public class ProxyFunctionExecutor : IFuncExecutor
     {
-        private readonly RequestDelegate _next;
+        private readonly WebScriptHostManager _scriptHostManager;
+        private readonly IWebJobsRouteHandler _routeHandler;
 
-        public FunctionInvocationMiddleware(RequestDelegate next)
+        internal ProxyFunctionExecutor(WebScriptHostManager scriptHostManager, IWebJobsRouteHandler routeHandler)
         {
-            _next = next;
+            _scriptHostManager = scriptHostManager;
+            _routeHandler = routeHandler;
         }
 
-        public static bool IsHomepageDisabled
+        public async Task<IActionResult> ExecuteFuncAsync(string functionName, Dictionary<string, object> arguments, CancellationToken cancellationToken)
         {
-            get
+            // TODO: This whole logic needs to be improved. This is just to unblock current work. - Hamids
+            // But whatever change we do here, needs to make sure tests are passing.
+
+            var request = arguments[ScriptConstants.AzureFunctionsHttpRequestKey] as HttpRequest;
+
+            // Local Function calls do not go thru ARR, so implementing the ARR's MAX-FORWARDs header logic here to avoid infinte redirects.
+            StringValues values;
+            int redirectCount = 0;
+            if (request.Headers.TryGetValue(ScriptConstants.AzureProxyFunctionLocalRedirectHeader, out values))
             {
-                return string.Equals(Environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsDisableHomepage),
-                    bool.TrueString, StringComparison.OrdinalIgnoreCase);
-            }
-        }
+                int.TryParse(values.FirstOrDefault(), out redirectCount);
 
-        public async Task Invoke(HttpContext context, WebScriptHostManager manager)
-        {
-            // flow required context through the request pipeline
-            // downstream middleware and filters rely on this
-            context.Items.Add(ScriptConstants.AzureFunctionsHostManagerKey, manager);
+                if (redirectCount >= ScriptConstants.AzureProxyFunctionMaxLocalRedirects)
+                {
+                    return new BadRequestObjectResult("Infinite loop detected when trying to call a local function or proxy from a proxy.");
+                }
 
-            await _next(context);
-
-            IFunctionExecutionFeature functionExecution = context.Features.Get<IFunctionExecutionFeature>();
-
-            // HttpBufferingService is disabled for non-proxy functions.
-            if (functionExecution != null && !functionExecution.Descriptor.Metadata.IsProxy)
-            {
-                var bufferingFeature = context.Features.Get<IHttpBufferingFeature>();
-                bufferingFeature?.DisableRequestBuffering();
-                bufferingFeature?.DisableResponseBuffering();
+                // This is to make sure the header is properly updated. removing it then adding it with updated count.
+                request.Headers.Remove(ScriptConstants.AzureProxyFunctionLocalRedirectHeader);
             }
 
-            IActionResult result = null;
+            redirectCount++;
+            request.Headers.Add(ScriptConstants.AzureProxyFunctionLocalRedirectHeader, redirectCount.ToString());
+
+            var route = request.HttpContext.GetRouteData();
+
+            RouteContext rc = new RouteContext(request.HttpContext);
+
+            foreach (var router in route.Routers)
+            {
+                var webJobsRouter = router as WebJobsRouter;
+                if (webJobsRouter != null)
+                {
+                    var routeColection = typeof(WebJobsRouter).GetField("_routeCollection", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(webJobsRouter);
+                    var routes = typeof(RouteCollection).GetField("_routes", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(routeColection) as List<IRouter>;
+
+                    if (routes != null)
+                    {
+                        routes.Reverse();
+                    }
+
+                    await webJobsRouter.RouteAsync(rc);
+
+                    if (rc.RouteData != null && rc.RouteData.DataTokens != null)
+                    {
+                        functionName = rc.RouteData.DataTokens["AZUREWEBJOBS_FUNCTIONNAME"].ToString();
+                    }
+
+                    if (routes != null)
+                    {
+                        routes.Reverse();
+                    }
+                }
+            }
+
+            var context = request.HttpContext;
+            var host = _scriptHostManager.Instance;
+
+            var function = _scriptHostManager.Instance.Functions.FirstOrDefault(f => string.Equals(f.Name, functionName));
+
+            var functionExecution = new FunctionExecutionFeature(host, function);
 
             if (functionExecution != null && !context.Response.HasStarted)
             {
-                result = await GetResultAsync(context, functionExecution);
-            }
-            else if (functionExecution == null
-                && context.Request.Path.Value == "/"
-                && !context.Response.HasStarted)
-            {
-                if (IsHomepageDisabled)
-                {
-                    result = new NoContentResult();
-                }
-                else
-                {
-                    result = new ContentResult()
-                    {
-                        Content = GetHomepage(),
-                        ContentType = "text/html",
-                        StatusCode = 200
-                    };
-                }
+                IActionResult result = await GetResultAsync(context, functionExecution);
+                return result;
             }
 
-            if (result != null && !context.Response.HasStarted)
-            {
-                var actionContext = new ActionContext
-                {
-                    HttpContext = context
-                };
-
-                await result.ExecuteResultAsync(actionContext);
-            }
+            return null;
         }
 
         private async Task<IActionResult> GetResultAsync(HttpContext context, IFunctionExecutionFeature functionExecution)
@@ -156,16 +169,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
             var authorizeResult = await policyEvaluator.AuthorizeAsync(policy, authenticateResult, context, descriptor);
 
             return authorizeResult.Succeeded;
-        }
-
-        private string GetHomepage()
-        {
-            var assembly = typeof(FunctionInvocationMiddleware).Assembly;
-            using (Stream resource = assembly.GetManifestResourceStream(assembly.GetName().Name + ".Home.html"))
-            using (var reader = new StreamReader(resource))
-            {
-                return reader.ReadToEnd();
-            }
         }
     }
 }
